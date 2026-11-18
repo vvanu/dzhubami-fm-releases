@@ -1,0 +1,45 @@
+name: Refresh update list
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: write
+concurrency:
+  group: public-update-list
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refresh public update list
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYCODE'
+          import base64, json, os, subprocess
+          repo=os.environ['GH_REPO']
+          def gh(*args, **kwargs):
+              return subprocess.check_output(['gh', *args], **kwargs)
+          releases=json.loads(gh('api', f'repos/{repo}/releases?per_page=50'))
+          result=[]
+          for platform in ('android','windows'):
+              candidates=[r for r in releases if not r['draft'] and not r['prerelease'] and r['tag_name'].startswith(platform+'-v')]
+              import re
+              candidates=[r for r in candidates if re.fullmatch(r'\d+\.\d+\.\d+',r['tag_name'].split('-v',1)[1])]
+              candidates.sort(key=lambda r:tuple(map(int,r['tag_name'].split('-v',1)[1].split('.'))),reverse=True)
+              if candidates:
+                  r=candidates[0];version=r['tag_name'].split('-v',1)[1]
+                  name=f'Dzhubami-FM-Android-v{version}.apk' if platform=='android' else f'Dzhubami-FM-Windows-x64-v{version}.zip'
+                  assets=[a for a in r['assets'] if a['name']==name]
+                  if len(assets)!=1 or not re.fullmatch(r'sha256:[a-f0-9]{64}',assets[0].get('digest') or ''):
+                      raise SystemExit('Missing verified build')
+                  a=assets[0]
+                  result.append(dict(tag_name=r['tag_name'],draft=False,prerelease=False,body=r.get('body') or '',assets=[{key:a[key] for key in ('name','size','digest','browser_download_url')}]))
+          data={'message':'Refresh verified update list','content':base64.b64encode((json.dumps(result,ensure_ascii=False,indent=2)+'\n').encode()).decode()}
+          old=json.loads(gh('api',f'repos/{repo}/contents/updates.json'))
+          data['sha']=old['sha']
+          gh('api','--method','PUT',f'repos/{repo}/contents/updates.json','--input','-',input=json.dumps(data).encode())
+          print('Public update list refreshed')
+          PYCODE
