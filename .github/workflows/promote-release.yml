@@ -1,0 +1,96 @@
+name: Publish a verified build
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        type: choice
+        options: [windows, android]
+        required: true
+      version:
+        required: true
+        type: string
+      source_url:
+        required: true
+        type: string
+      sha256:
+        required: true
+        type: string
+      release_notes:
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: publish-${{ inputs.platform }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release parameters
+        id: release
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          SHA256: ${{ inputs.sha256 }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          platform, version = os.environ['PLATFORM'], os.environ['VERSION']
+          if platform not in ('windows', 'android') or not re.fullmatch(r'\d+\.\d+\.\d+', version):
+              raise SystemExit('Invalid platform or version')
+          url = urlsplit(os.environ['SOURCE_URL'])
+          if url.scheme != 'https' or url.hostname not in ('release-assets.githubusercontent.com', 'objects.githubusercontent.com') or url.username or url.password or any(ord(c) < 32 for c in os.environ['SOURCE_URL']):
+              raise SystemExit('Only temporary GitHub asset URLs are allowed')
+          if not re.fullmatch(r'[a-fA-F0-9]{64}', os.environ['SHA256']):
+              raise SystemExit('Invalid SHA256')
+          name = f'Dzhubami-FM-Windows-x64-v{version}.zip' if platform == 'windows' else f'Dzhubami-FM-Android-v{version}.apk'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'name={name}\ntag={platform}-v{version}\n')
+          Path('release-notes.md').write_text(os.environ['RELEASE_NOTES'])
+          PY
+      - name: Download the approved binary
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+          RELEASE_FILE: ${{ steps.release.outputs.name }}
+        run: curl --fail --location --proto '=https' --max-filesize 1073741824 --retry 2 --output "$RELEASE_FILE" "$SOURCE_URL"
+      - name: Verify checksum and package
+        env:
+          RELEASE_FILE: ${{ steps.release.outputs.name }}
+          PLATFORM: ${{ inputs.platform }}
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ inputs.sha256 }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, zipfile
+          from pathlib import Path
+          file = Path(os.environ['RELEASE_FILE'])
+          digest = hashlib.sha256(file.read_bytes()).hexdigest()
+          if digest != os.environ['SHA256'].lower():
+              raise SystemExit('Checksum mismatch')
+          with zipfile.ZipFile(file) as archive:
+              assert archive.testzip() is None
+              if os.environ['PLATFORM'] == 'windows':
+                  package = json.loads(archive.read('Dzhubami-FM/resources/app/package.json'))
+                  assert package['name'] == 'dzhubami-fm' and package['version'] == os.environ['VERSION']
+                  assert archive.getinfo('Dzhubami-FM/ДЖУБАмИ FM.exe').file_size > 0
+          Path('SHA256SUMS.txt').write_text(digest + '  ' + file.name + '\n')
+          PY
+      - name: Publish without replacing existing versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_FILE: ${{ steps.release.outputs.name }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          PLATFORM: ${{ inputs.platform }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo 'This version already exists; publish a newer version.'
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" --title "${PLATFORM} ${VERSION}" --notes-file release-notes.md --latest=false "$RELEASE_FILE" SHA256SUMS.txt
